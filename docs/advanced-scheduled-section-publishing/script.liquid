@@ -1,5 +1,5 @@
 {% assign run_mode = options.run_mode__required %}
-{% assign datetime_to_publish = options.datetime_to_publish %}
+{% assign datetime_to_publish = options.datetime_to_publish__datetime_futureonly %}
 {% assign theme_id = options.theme_id__number_required %}
 {% assign template_name = options.template_name__required %}
 {% assign section_visibility = options.section_visibility__keyval %}
@@ -146,6 +146,47 @@
       template_path: template_path,
       available_sections: available_sections
     %}
+
+    {% comment %}
+      -- Save the discovered sections to a shop metafield so they're visible in Shopify Admin
+    {% endcomment %}
+
+    {% capture metafield_key %}discovered_sections_{{ template_name | replace: ".", "_" }}{% endcapture %}
+
+    {% action "shopify" %}
+      mutation {
+        metafieldsSet(
+          metafields: [
+            {
+              ownerId: {{ shop.id | json }}
+              namespace: "mechanic"
+              key: {{ metafield_key | json }}
+              type: "json"
+              value: {{ available_sections | json | json }}
+            }
+          ]
+        ) {
+          metafields {
+            id
+            namespace
+            key
+            value
+            owner {
+              ... on Shop {
+                id
+                name
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    {% endaction %}
+
+    {% log message: "Discovered sections have been saved to shop metafield 'mechanic.{{ metafield_key }}' - you can view this in Shopify Admin > Settings > Custom data > Metafields" %}
 
     {% comment %}
       -- If only fetching sections, don't make any changes
