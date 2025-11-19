@@ -1,84 +1,111 @@
-{% assign datetime_to_publish = options.datetime_to_publish__required %}
+{% assign run_mode = options.run_mode__required %}
+{% assign datetime_to_publish = options.datetime_to_publish__datetime_futureonly %}
 {% assign theme_id = options.theme_id__number_required %}
-{% assign template_names_and_section_ids_to_publish = options.template_names_and_section_ids_to_publish__keyval_multiline %}
-{% assign template_names_and_section_ids_to_unpublish = options.template_names_and_section_ids_to_unpublish__keyval_multiline %}
+{% assign template_name = options.template_name__required %}
+{% assign section_visibility = options.section_visibility__keyval %}
+{% assign fetch_template_sections = options.fetch_template_sections__boolean %}
 
-{% assign template_names
-  = template_names_and_section_ids_to_publish
-  | keys
-  | default: array
-%}
-{% assign template_names
-  = template_names_and_section_ids_to_unpublish
-  | keys
-  | default: array
-  | concat: template_names
-  | uniq
-%}
+{% comment %}
+  -- Validate that we have sections configured or fetch mode is enabled
+{% endcomment %}
 
-{% if template_names == blank %}
-  {% error "Configure at least one template name and section ID to publish or unpublish." %}
+{% if section_visibility == blank and fetch_template_sections == false %}
+  {% error "Either configure section visibility or enable 'Fetch template sections' to discover available sections." %}
   {% break %}
 {% endif %}
 
-{% if event.topic contains "mechanic/scheduler/" or event.topic == "mechanic/user/trigger" %}
-  {% if event.topic contains "mechanic/scheduler/" %}
-    {% assign datetime = "now" | date: "%Y-%m-%d %H:%M" %}
+{% comment %}
+  -- Validate datetime when in scheduled mode
+{% endcomment %}
 
-    {% unless datetime_to_publish == datetime or event.preview %}
-      {% log
-        message: "Configured datetime to publish does not match run date; ending this task run.",
-        run_date: datetime,
-        datetime_to_publish: datetime_to_publish
-      %}
-      {% break %}
-    {% endunless %}
-  {% endif %}
+{% if run_mode == "scheduled" and datetime_to_publish == blank %}
+  {% error "Datetime to publish is required when run mode is set to 'scheduled'." %}
+  {% break %}
+{% endif %}
 
-  {% for template_name in template_names %}
-    {% if template_name == blank %}
-      {% continue %}
+{% if event.topic == "mechanic/user/trigger" or event.topic contains "mechanic/scheduler/" %}
+  {% comment %}
+    -- Check if we should proceed based on run mode
+  {% endcomment %}
+
+  {% assign should_proceed = false %}
+
+  {% if event.topic == "mechanic/user/trigger" %}
+    {% if run_mode == "manual" %}
+      {% assign should_proceed = true %}
+      {% log message: "Manual trigger activated - proceeding with section updates" %}
+    {% else %}
+      {% log message: "Manual trigger received but run mode is set to 'scheduled' - ignoring" %}
     {% endif %}
 
-    {% assign section_ids_to_publish = template_names_and_section_ids_to_publish[template_name] | split: newline %}
-    {% assign section_ids_to_unpublish = template_names_and_section_ids_to_unpublish[template_name] | split: newline %}
+  {% elsif event.topic contains "mechanic/scheduler/" %}
+    {% if run_mode == "scheduled" %}
+      {% assign current_datetime = "now" | date: "%Y-%m-%d %H:%M" %}
 
-    {% log
-      template_name: template_name,
-      section_ids_to_publish: section_ids_to_publish,
-      section_ids_to_unpublish: section_ids_to_unpublish
-    %}
+      {% if datetime_to_publish == current_datetime or event.preview %}
+        {% assign should_proceed = true %}
+        {% log
+          message: "Scheduled time matched - proceeding with section updates",
+          current_datetime: current_datetime,
+          datetime_to_publish: datetime_to_publish
+        %}
+      {% else %}
+        {% log
+          message: "Scheduled time does not match - skipping",
+          current_datetime: current_datetime,
+          datetime_to_publish: datetime_to_publish
+        %}
+      {% endif %}
+    {% else %}
+      {% log message: "Scheduler triggered but run mode is set to 'manual' - ignoring" %}
+    {% endif %}
+  {% endif %}
 
-    {% capture template_path %}templates/{{ template_name }}.json{% endcapture %}
+  {% unless should_proceed or event.preview %}
+    {% break %}
+  {% endunless %}
 
-    {% action %}
-      {
-        "type": "shopify",
-        "options": [
-          "get",
-          "/admin/themes/{{ theme_id }}/assets.json?asset[key]={{ template_path }}"
-        ],
-        "meta": {
-          "template_path": {{ template_path | json }},
-          "section_ids_to_publish": {{ section_ids_to_publish | json }},
-          "section_ids_to_unpublish": {{ section_ids_to_unpublish | json }}
-        }
+  {% comment %}
+    -- Fetch the template file from Shopify
+  {% endcomment %}
+
+  {% capture template_path %}templates/{{ template_name }}.json{% endcapture %}
+
+  {% log
+    template_name: template_name,
+    template_path: template_path,
+    section_visibility: section_visibility,
+    fetch_template_sections: fetch_template_sections
+  %}
+
+  {% action %}
+    {
+      "type": "shopify",
+      "options": [
+        "get",
+        "/admin/themes/{{ theme_id }}/assets.json?asset[key]={{ template_path }}"
+      ],
+      "meta": {
+        "template_path": {{ template_path | json }},
+        "section_visibility": {{ section_visibility | json }},
+        "fetch_template_sections": {{ fetch_template_sections | json }}
       }
-    {% endaction %}
-  {% endfor %}
+    }
+  {% endaction %}
 
 {% elsif event.topic == "mechanic/actions/perform" %}
   {% comment %}
-    -- NOTE: Shopify will throw a 404 error on the GET if the asset is not accessible, halting that action, so no error checking is needed here
+    -- Process the template file and update section visibility
+    -- NOTE: Shopify will throw a 404 error on the GET if the asset is not accessible
   {% endcomment %}
 
   {% assign template_path = action.meta.template_path %}
-  {% assign section_ids_to_publish = action.meta.section_ids_to_publish %}
-  {% assign section_ids_to_unpublish = action.meta.section_ids_to_unpublish %}
+  {% assign section_visibility = action.meta.section_visibility %}
+  {% assign fetch_template_sections = action.meta.fetch_template_sections %}
 
   {% unless template_path or event.preview %}
     {% comment %}
-      -- stop processing if a meta value is not present (i.e. theme asset update actions)
+      -- Stop processing if meta values are not present
     {% endcomment %}
     {% break %}
   {% endunless %}
@@ -87,36 +114,154 @@
 
   {% if event.preview %}
     {% assign asset = hash %}
-    {% assign asset["value"] = hash | json %}
+    {% assign asset["value"] = '{"sections":{"header":{"type":"header","disabled":false},"announcement-bar":{"type":"announcement-bar","disabled":true},"slideshow":{"type":"slideshow","disabled":false}},"order":["header","announcement-bar","slideshow"]}' %}
   {% endif %}
 
   {% assign asset_value = asset.value | parse_json %}
   {% assign section_names = asset_value.sections | keys %}
 
-  {% assign matched_sections_to_publish = array %}
-  {% assign matched_sections_to_unpublish = array %}
+  {% comment %}
+    -- If fetch mode is enabled, log available sections for user reference
+  {% endcomment %}
 
-  {% for section_name in section_names %}
-    {% if section_ids_to_publish contains section_name %}
-      {% assign matched_sections_to_publish = matched_sections_to_publish | push: section_name %}
-      {% assign asset_value["sections"][section_name]["disabled"] = false %}
+  {% if fetch_template_sections %}
+    {% assign available_sections = array %}
 
-    {% elsif section_ids_to_unpublish contains section_name %}
-      {% assign matched_sections_to_unpublish = matched_sections_to_unpublish | push: section_name %}
-      {% assign asset_value["sections"][section_name]["disabled"] = true %}
+    {% for section_name in section_names %}
+      {% assign section = asset_value.sections[section_name] %}
+      {% assign section_info = hash %}
+      {% assign section_info["id"] = section_name %}
+      {% assign section_info["type"] = section.type %}
+      {% assign section_info["currently_visible"] = true %}
+
+      {% if section.disabled %}
+        {% assign section_info["currently_visible"] = false %}
+      {% endif %}
+
+      {% assign available_sections = available_sections | push: section_info %}
+    {% endfor %}
+
+    {% log
+      message: "Available sections in template - use these IDs in the 'Section visibility' configuration",
+      template_path: template_path,
+      available_sections: available_sections
+    %}
+
+    {% comment %}
+      -- Save the discovered sections to a shop metafield so they're visible in Shopify Admin
+    {% endcomment %}
+
+    {% capture metafield_key %}discovered_sections_{{ template_name | replace: ".", "_" }}{% endcapture %}
+
+    {% action "shopify" %}
+      mutation {
+        metafieldsSet(
+          metafields: [
+            {
+              ownerId: {{ shop.id | json }}
+              namespace: "mechanic"
+              key: {{ metafield_key | json }}
+              type: "json"
+              value: {{ available_sections | json | json }}
+            }
+          ]
+        ) {
+          metafields {
+            id
+            namespace
+            key
+            value
+            owner {
+              ... on Shop {
+                id
+                name
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    {% endaction %}
+
+    {% log message: "Discovered sections have been saved to shop metafield 'mechanic.{{ metafield_key }}' - you can view this in Shopify Admin > Settings > Custom data > Metafields" %}
+
+    {% comment %}
+      -- If only fetching sections, don't make any changes
+    {% endcomment %}
+
+    {% if section_visibility == blank %}
+      {% log message: "Fetch mode enabled with no section visibility configured - no changes will be made. Configure section visibility based on the available sections listed above." %}
+      {% break %}
+    {% endif %}
+  {% endif %}
+
+  {% comment %}
+    -- Apply section visibility changes
+  {% endcomment %}
+
+  {% assign sections_shown = array %}
+  {% assign sections_hidden = array %}
+  {% assign sections_not_found = array %}
+
+  {% for keyval in section_visibility %}
+    {% assign section_id = keyval[0] %}
+    {% assign visibility = keyval[1] | strip | downcase %}
+
+    {% comment %}
+      -- Check if section exists in template
+    {% endcomment %}
+
+    {% unless section_names contains section_id %}
+      {% assign sections_not_found = sections_not_found | push: section_id %}
+      {% continue %}
+    {% endunless %}
+
+    {% comment %}
+      -- Update section disabled state based on visibility setting
+    {% endcomment %}
+
+    {% if visibility == "show" or visibility == "visible" or visibility == "enabled" or visibility == "true" %}
+      {% assign asset_value["sections"][section_id]["disabled"] = false %}
+      {% assign sections_shown = sections_shown | push: section_id %}
+
+    {% elsif visibility == "hide" or visibility == "hidden" or visibility == "disabled" or visibility == "false" %}
+      {% assign asset_value["sections"][section_id]["disabled"] = true %}
+      {% assign sections_hidden = sections_hidden | push: section_id %}
+
+    {% else %}
+      {% log
+        message: "Invalid visibility value for section - use 'show' or 'hide'",
+        section_id: section_id,
+        visibility: visibility
+      %}
     {% endif %}
   {% endfor %}
 
   {% log
     template_path: template_path,
-    matched_sections_to_publish: matched_sections_to_publish,
-    matched_sections_to_unpublish: matched_sections_to_unpublish
+    sections_shown: sections_shown,
+    sections_hidden: sections_hidden,
+    sections_not_found: sections_not_found
   %}
 
-  {% unless matched_sections_to_publish != blank or matched_sections_to_unpublish != blank or event.preview %}
-    {% log "No matched sections to publish or unpublish; no update will be made." %}
+  {% if sections_not_found != blank %}
+    {% log
+      message: "Warning: Some configured sections were not found in the template",
+      sections_not_found: sections_not_found
+    %}
+  {% endif %}
+
+  {% unless sections_shown != blank or sections_hidden != blank or event.preview %}
+    {% log message: "No section visibility changes were applied - check your configuration" %}
     {% break %}
   {% endunless %}
+
+  {% comment %}
+    -- Update the template file
+  {% endcomment %}
 
   {% action "shopify" %}
     [
